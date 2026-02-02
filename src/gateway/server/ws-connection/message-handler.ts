@@ -30,7 +30,12 @@ import {
   type AuthRateLimiter,
 } from "../../auth-rate-limit.js";
 import type { GatewayAuthResult, ResolvedGatewayAuth } from "../../auth.js";
-import { authorizeGatewayConnect, isLocalDirectRequest } from "../../auth.js";
+import {
+  authorizeGatewayConnect,
+  isLocalDirectRequest,
+  shouldTrustLocalhost,
+  validateHostHeader,
+} from "../../auth.js";
 import {
   buildCanvasScopedHostUrl,
   CANVAS_CAPABILITY_TTL_MS,
@@ -152,6 +157,23 @@ export function attachGatewayWsMessageHandler(params: {
   const hostIsTailscaleServe = hostName.endsWith(".ts.net");
   const hostIsLocalish = hostIsLocal || hostIsTailscaleServe;
   const isLocalClient = isLocalDirectRequest(upgradeReq, trustedProxies);
+
+  // Validate Host header to protect against DNS rebinding attacks.
+  // This check runs even for local clients as an additional defense layer.
+  const hostValidation = validateHostHeader(upgradeReq, resolvedAuth.allowedHosts);
+  if (!hostValidation.valid) {
+    logWsControl.warn(
+      `Rejected connection with invalid Host header: ${hostValidation.host || "(empty)"} ` +
+        `(reason: ${hostValidation.reason}). Possible DNS rebinding attack.`,
+    );
+    close(1008, "invalid host header");
+    return;
+  }
+
+  // Determine if we should apply localhost trust for this connection.
+  // This requires explicit opt-in via config AND passing all security checks.
+  const trustsLocalhost = shouldTrustLocalhost(upgradeReq, resolvedAuth, trustedProxies);
+
   const reportedClientIp =
     isLocalClient || hasUntrustedProxyHeaders
       ? undefined
@@ -484,7 +506,9 @@ export function attachGatewayWsMessageHandler(params: {
             close(1008, "device signature expired");
             return;
           }
-          const nonceRequired = !isLocalClient;
+          // Nonce is required unless trustLocalhost is explicitly enabled AND
+          // this is a verified local connection. Default: always require nonce.
+          const nonceRequired = !trustsLocalhost;
           const providedNonce = typeof device.nonce === "string" ? device.nonce.trim() : "";
           if (nonceRequired && !providedNonce) {
             setHandshakeState("failed");
